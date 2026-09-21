@@ -14,6 +14,10 @@
 - 可选的**乐观并发保护**：每个容器持久化一个整数 `version`（创建时为 0），
   `GET /containers/{id}` 返回当前版本；批量提交/预演可携带 `expected_versions`
   做版本校验，成功提交后每个被触碰容器的版本恰好加 1（同批多次出现也只加 1）。
+- 可选的**幂等键** `idempotency_key`（仅 `/transfers/batch` 生效）：成功请求的
+  请求体指纹与完整响应与转移**写入同一 SQLite 事务**；同键同请求体重放首次结果
+  （不重复扣减体积、不重复递增 `version`），同键但请求体不同返回
+  `409 idempotency_conflict`。预演接口不写幂等记录；不携带键时行为与旧版本完全一致。
 - 可查询任一容器的**当前体积**以及各祖先初始样品的**来源占比**。
 
 ---
@@ -39,6 +43,38 @@ docker compose up --build
 3. 启动 uvicorn。
 
 SQLite 数据保存在 Docker 命名卷 `lineage-data`（容器内 `/data`）中，重启不丢失。
+
+### 旧版本数据库的自动迁移
+
+直接用新镜像启动挂载了**旧数据卷**的容器即可，无需手工迁移——启动时的
+`init_db()` 全部是幂等 DDL：
+
+- 旧库缺少 `containers.version` 列时自动 `ALTER TABLE ... ADD COLUMN` 补齐，
+  已有容器的版本一律视为 `0`；
+- 旧库缺少幂等表时自动创建 `idempotency_keys`
+  （`idempotency_key` 主键、`request_sha256` 请求体指纹、`status_code`、
+  `response_body` 完整响应、`created`），历史数据不受影响，旧客户端不带键
+  请求的行为也完全不变。
+
+升级步骤（保留数据）：
+
+```bash
+git pull                                   # 或重新构建镜像
+docker compose up --build -d               # 复用 lineage-data 卷，启动即自动迁移
+docker compose logs -f api                 # 看到 “database ready” 即迁移完成
+```
+
+如需确认迁移结果，可在容器内查询：
+
+```bash
+docker compose exec api python -c "
+from app.db import connect
+c = connect()
+print([r[0] for r in c.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")])
+print([r[1] for r in c.execute('PRAGMA table_info(containers)')])
+"
+# 应包含 idempotency_keys 表，containers 列中应包含 version
+```
 
 停止与清理：
 
@@ -72,6 +108,10 @@ docker compose down -v       # 同时删除数据卷
 - 每个容器额外持久化一个整数 **`version`**：创建（样品/空容器）时为 `0`，每次成功的
   批量转移后被触碰的容器加 1（同批多次触碰只加 1），用于 `expected_versions` 乐观并发控制。
   服务启动时会自动为旧版本数据库补齐该列，已有容器的版本视为 `0`，无需手工迁移。
+- 表 **`idempotency_keys`** 仅服务于 `/transfers/batch` 的可选幂等：只在批次成功提交时
+  写入一行，记录幂等键、原始请求体的 SHA-256 指纹、首次响应的 HTTP 状态码与完整响应体；
+  该行与容器扣减、`version` 递增在**同一个 SQLite 事务**内落库。预演接口不写此表，
+  失败的批次（4xx，包括业务错误、`stale_container`、`idempotency_conflict`）也不写。
 
 ---
 
@@ -143,6 +183,57 @@ curl -X POST http://localhost:8000/transfers/batch \
 # 200 -> {"applied":1,"message":"已依次提交 1 条转移","versions":{"S1":1,"V1":1}}
 ```
 
+#### 可选：幂等键（idempotency_key）
+
+请求体可选携带 `idempotency_key`（非空白字符串，最长 255；键两侧空白会被去掉后使用）。
+键仅对 `/transfers/batch` 生效，建议由客户端为每个“意图”生成一个稳定的唯一值
+（如 UUID），在网络超时、收到 5xx 等不确定结果时用**同一个键、同一个请求体**安全重试：
+
+- **首次成功**：请求体指纹（未经解析的**原始请求体字节**的 SHA-256）、HTTP 状态码与
+  **完整响应**与本批转移写入**同一个 SQLite 事务**——幂等记录与扣减要么同时可见，
+  要么一起回滚；
+- **同键同请求体重放**：直接返回首次响应（响应体逐字节一致），并带响应头
+  `Idempotency-Replayed: true`；**不会再次扣减体积、不会再次递增 `version`**，
+  也不会重新执行业务校验（例如首次之后 `expected_versions` 已过期，重放仍返回首次结果）；
+- **同键但请求体不同**：返回 `409 idempotency_conflict`，整批拒绝且不落库
+  （注意指纹以**原始字节**为准：即使语义相同，JSON 空白、键顺序、数字 `40` 与
+  字符串 `"40"` 的差异也算不同请求体；请直接重发首次的原始报文）；
+- **失败请求不留痕**：任何 4xx（参数错误、源液不足、未知容器、`stale_container` 等）
+  都不会写入幂等记录，同一个键可以修正请求后继续重试；
+- 预演接口 `/transfers/preview` **不查、不写**幂等记录（请求体里带了键也会被忽略），
+  不会“消费”键；
+- **不携带** `idempotency_key` 时与旧版本行为完全一致（每批正常执行一次）。
+
+```bash
+# 首次提交
+curl -X POST http://localhost:8000/transfers/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"transfers":[{"source":"S1","destination":"V1","volume":"40"}],
+       "idempotency_key":"b7f2e1a9-4f1c-4d6a-9c23-7a8e0d6b3f11"}'
+# 200 -> {"applied":1,"message":"已依次提交 1 条转移","versions":{"S1":1,"V1":1}}
+
+# 同样的键 + 完全相同的请求体重试（如超时后）：重放，不重复扣减、不重复 +1 版本
+curl -X POST http://localhost:8000/transfers/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"transfers":[{"source":"S1","destination":"V1","volume":"40"}],
+       "idempotency_key":"b7f2e1a9-4f1c-4d6a-9c23-7a8e0d6b3f11"}' \
+  -D -
+# HTTP/1.1 200
+# idempotency-replayed: true
+# {"applied":1,"message":"已依次提交 1 条转移","versions":{"S1":1,"V1":1}}
+
+# 同一个键但请求体不同（体积改成 41）：
+curl -X POST http://localhost:8000/transfers/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"transfers":[{"source":"S1","destination":"V1","volume":"41"}],
+       "idempotency_key":"b7f2e1a9-4f1c-4d6a-9c23-7a8e0d6b3f11"}'
+# 409 -> {"error":{"code":"idempotency_conflict",
+#         "message":"幂等键 'b7f2e1a9-...' 已用于另一个请求体，整批拒绝且不落库"}}
+```
+
+幂等键与 `expected_versions` 可以同时使用：`expected_versions` 只是请求体的一部分，
+首次提交时正常校验；重放时直接返回首次响应、不再校验版本。
+
 **整批拒绝**的情形（HTTP 状态码与错误码）：
 
 | 情形 | 状态码 | `error.code` |
@@ -153,6 +244,7 @@ curl -X POST http://localhost:8000/transfers/batch \
 | 体积为 0、为负、非有限数，或小数位超过 `DECIMAL_SCALE` | 422 | `invalid_volume` |
 | `expected_versions` 未恰好覆盖本批全部源/目标（含空对象） | 422 | `invalid_expected_versions` |
 | `expected_versions` 中某容器版本与当前版本不符 | 409 | `stale_container` |
+| 同一 `idempotency_key` 已用于另一个请求体（指纹不同） | 409 | `idempotency_conflict` |
 
 错误响应形如：
 
@@ -163,7 +255,8 @@ curl -X POST http://localhost:8000/transfers/batch \
 ### 4. 预演批量转移（不落库）
 
 `POST /transfers/preview` 使用与批量提交**完全相同的请求结构**（同样接受可选的
-`expected_versions`），在数据库当前状态上按数组顺序整批模拟（链式转移使用本批前序
+`expected_versions`；`idempotency_key` 字段虽可出现但会被**忽略**——预演不查重、
+不重放、不写幂等记录），在数据库当前状态上按数组顺序整批模拟（链式转移使用本批前序
 模拟结果），返回：
 
 - `steps`：每一步的**条目序号**与从各祖先来源**实际扣取的精确份额**（`taken` 之和

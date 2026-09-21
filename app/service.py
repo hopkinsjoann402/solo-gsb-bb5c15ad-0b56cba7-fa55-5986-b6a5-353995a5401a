@@ -16,12 +16,21 @@
   :func:`_simulate_transfers`），错误码与条目序号完全一致；
   预演只读不写（不递增 version），无论成功失败都不改变数据库，但返回中给出
   若真实提交后各容器将变成的 version（当前 version + 1）。
+* ``POST /transfers/batch`` 可选携带 ``idempotency_key``：携带时首次成功请求的
+  请求体指纹（原始请求体字节的 SHA-256）与**完整响应**与容器扣减/版本递增写入
+  **同一个写事务**（见 :func:`apply_transfers_idempotent`）。同键同请求体的
+  后续请求直接重放首次响应，不再扣减体积、不再递增 version；同键但请求体不同
+  返回 409 idempotency_conflict。失败的请求（4xx）不落任何记录，可用同键重试。
+  预演接口不写幂等记录；不携带幂等键时行为完全保持兼容。
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from collections.abc import Iterable, Mapping
 from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal, localcontext
+from typing import NamedTuple
 
 from .config import VOLUME_QUANTUM, settings
 
@@ -316,6 +325,120 @@ def _simulate_transfers(
     return touched, versions, taken_steps
 
 
+def build_batch_response(applied: int, versions: Versions) -> dict:
+    """构造批量提交的响应体（首次写入与 API 返回共用，保证重放内容一致）。"""
+    return {
+        "applied": applied,
+        "message": f"已依次提交 {applied} 条转移",
+        "versions": versions,
+    }
+
+
+def fingerprint_request(raw_body: bytes) -> str:
+    """计算原始请求体字节的 SHA-256 指纹（小写 hex）。
+
+    以**未经解析的原始请求体**为准：语义相同但字节不同的两个请求体
+    （如 JSON 键顺序、空白、数字写法差异）视为不同请求，同键提交时返回 409。
+    """
+    return hashlib.sha256(raw_body).hexdigest()
+
+
+class BatchResult(NamedTuple):
+    """一批转移的提交结果。
+
+    ``replayed=True`` 时为幂等重放：``payload`` 是首次请求持久化的完整响应，
+    数据库未被再次修改（体积不重复扣减、version 不重复递增）。
+    """
+
+    applied: int
+    versions: Versions
+    replayed: bool
+    status_code: int
+    payload: dict
+
+
+def _commit_batch(
+    conn: sqlite3.Connection,
+    prepared: list[tuple[str, str, Decimal]],
+    expected_versions: Mapping[str, int] | None,
+    idempotency_key: str | None = None,
+    request_sha256: str | None = None,
+) -> BatchResult:
+    """在单个写事务内完成一批转移的全部读写（幂等逻辑亦在此事务内）。
+
+    调用前必须已完成与数据库状态无关的参数/覆盖校验。
+    IMMEDIATE 保证“幂等查重 + 状态校验 + 扣减写入 + 幂等记录写入”原子发生：
+
+    * 携带 ``idempotency_key`` 且键已存在：指纹一致 -> 回滚后重放首次响应
+      （不重复扣减、不重复递增 version）；指纹不一致 -> 回滚后抛
+      409 idempotency_conflict；
+    * 键不存在：正常模拟、持久化，并在**同一事务**插入请求指纹与完整响应；
+    * 不携带幂等键：行为与旧版本完全一致。
+    """
+    # IMMEDIATE：拿到写锁后再读版本与状态，保证“校验+写入”在同一写事务内原子
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if idempotency_key is not None:
+            row = conn.execute(
+                "SELECT request_sha256, status_code, response_body FROM idempotency_keys"
+                " WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if row is not None:
+                if row["request_sha256"] != request_sha256:
+                    raise LineageError(
+                        409,
+                        "idempotency_conflict",
+                        (
+                            f"幂等键 '{idempotency_key}' 已用于另一个请求体，"
+                            "整批拒绝且不落库"
+                        ),
+                    )
+                # 同键同请求体：回滚只读事务，逐字节重放首次结果
+                conn.execute("ROLLBACK")
+                payload = json.loads(row["response_body"])
+                return BatchResult(
+                    applied=payload["applied"],
+                    versions=dict(payload["versions"]),
+                    replayed=True,
+                    status_code=row["status_code"],
+                    payload=payload,
+                )
+
+        touched, current_versions, _taken = _simulate_transfers(
+            conn, prepared, expected_versions
+        )
+        next_versions = {cid: ver + 1 for cid, ver in current_versions.items()}
+        _persist_states(conn, touched, next_versions)
+
+        payload = build_batch_response(len(prepared), next_versions)
+        if idempotency_key is not None:
+            # 与转移写入同一事务持久化指纹与完整响应；重复键由主键兜底为整批失败
+            conn.execute(
+                "INSERT INTO idempotency_keys"
+                " (idempotency_key, request_sha256, status_code, response_body)"
+                " VALUES (?, ?, ?, ?)",
+                (
+                    idempotency_key,
+                    request_sha256,
+                    200,
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    return BatchResult(
+        applied=len(prepared),
+        versions=next_versions,
+        replayed=False,
+        status_code=200,
+        payload=payload,
+    )
+
+
 def apply_transfers(
     conn: sqlite3.Connection,
     transfers: Iterable[tuple[str, str, Decimal]],
@@ -328,24 +451,37 @@ def apply_transfers(
     出现多少次）version 恰好加 1。
 
     返回 ``(执行的转移条数, 各被触碰容器提交后的 version)``。
+    不带幂等键的兼容入口；幂等提交见 :func:`apply_transfers_idempotent`。
+    """
+    result = apply_transfers_idempotent(
+        conn, transfers, expected_versions, idempotency_key=None
+    )
+    return result.applied, result.versions
+
+
+def apply_transfers_idempotent(
+    conn: sqlite3.Connection,
+    transfers: Iterable[tuple[str, str, Decimal]],
+    expected_versions: Mapping[str, int] | None = None,
+    *,
+    idempotency_key: str | None,
+    request_sha256: str | None = None,
+) -> BatchResult:
+    """带幂等键的批量提交，返回 :class:`BatchResult`（含是否重放与完整响应）。
+
+    ``idempotency_key`` 为 ``None`` 时与 :func:`apply_transfers` 完全等价
+    （不查、不写 ``idempotency_keys``）。提供幂等键时必须同时提供
+    ``request_sha256``（由 :func:`fingerprint_request` 对原始请求体计算）：
+
+    * 同键同指纹 -> 重放首次结果，``replayed=True``，不扣减、不递增 version；
+    * 同键异指纹 -> 409 idempotency_conflict，整批回滚；
+    * 新键 -> 正常提交，指纹与完整响应与转移写入同一事务。
     """
     prepared = _prepare_transfers(transfers)
     _validate_expected_coverage(prepared, expected_versions)
-
-    # IMMEDIATE：拿到写锁后再读版本与状态，保证“校验+写入”在同一写事务内原子
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        touched, current_versions, _taken = _simulate_transfers(
-            conn, prepared, expected_versions
-        )
-        next_versions = {cid: ver + 1 for cid, ver in current_versions.items()}
-        _persist_states(conn, touched, next_versions)
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-
-    return len(prepared), next_versions
+    return _commit_batch(
+        conn, prepared, expected_versions, idempotency_key, request_sha256
+    )
 
 
 def preview_transfers(

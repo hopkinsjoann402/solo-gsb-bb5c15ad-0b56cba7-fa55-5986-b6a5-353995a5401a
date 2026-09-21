@@ -29,6 +29,7 @@ def _clean_tables():
     try:
         conn.execute("DELETE FROM components")
         conn.execute("DELETE FROM containers")
+        conn.execute("DELETE FROM idempotency_keys")
         yield
     finally:
         conn.close()

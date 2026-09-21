@@ -68,6 +68,26 @@ class BatchTransferIn(BaseModel):
             "不提供时保持无版本校验的兼容行为。"
         ),
     )
+    idempotency_key: str | None = Field(
+        default=None,
+        max_length=255,
+        description=(
+            "仅对 POST /transfers/batch 生效的可选幂等键。"
+            "携带时：成功请求的请求体指纹（原始请求体的 SHA-256）与完整响应与"
+            "转移写入同一事务持久化；同键同请求体重放首次结果（不重复扣减体积、"
+            "不重复递增 version），同键但请求体不同返回 409 idempotency_conflict。"
+            "预演接口不写幂等记录（携带也被忽略）；不携带时行为与旧版本完全一致。"
+        ),
+    )
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _non_blank_idempotency_key(cls, v: str | None) -> str | None:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                raise ValueError("idempotency_key 不能为空字符串")
+        return v
 
     @field_validator("expected_versions", mode="before")
     @classmethod

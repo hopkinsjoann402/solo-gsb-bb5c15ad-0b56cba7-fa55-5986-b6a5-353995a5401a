@@ -7,6 +7,7 @@ pip install --no-cache-dir -r /app/requirements.txt
 
 echo "[entrypoint] 初始化数据库..."
 python -c "from app.db import init_db; init_db(); print('database ready at', __import__('app.config', fromlist=['settings']).settings.database_path)"
+echo "[entrypoint] 数据库就绪（已有卷上的旧库会自动补齐 containers.version 列与 idempotency_keys 表，幂等迁移，无需手工操作）"
 
 echo "[entrypoint] 启动 uvicorn (0.0.0.0:${PORT:-8000})..."
 exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}"
