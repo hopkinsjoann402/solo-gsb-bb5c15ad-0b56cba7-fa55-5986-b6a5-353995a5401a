@@ -27,6 +27,7 @@ def _init():
 def _clean_tables():
     conn = connect()
     try:
+        conn.execute("DELETE FROM idempotent_requests")
         conn.execute("DELETE FROM components")
         conn.execute("DELETE FROM containers")
         yield

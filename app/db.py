@@ -31,11 +31,28 @@ CREATE TABLE IF NOT EXISTS components (
 );
 
 CREATE INDEX IF NOT EXISTS idx_components_source ON components(source_id);
+
+-- POST /transfers/batch 的幂等记录：仅成功请求落表，与转移写入同一事务。
+-- 重放时按 key 取回首次的完整响应，不再扣减体积、不递增 version。
+CREATE TABLE IF NOT EXISTS idempotent_requests (
+    idempotency_key TEXT PRIMARY KEY,
+    -- 请求指纹：请求体（除 idempotency_key 外）规范化 JSON 的 SHA-256（十六进制）
+    request_fingerprint TEXT NOT NULL,
+    -- 首次成功响应的完整 JSON（重放时原样返回）
+    response_json   TEXT NOT NULL,
+    status_code     INTEGER NOT NULL DEFAULT 200,
+    created         INTEGER NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 """
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """对已有数据库做幂等升级（旧库没有 containers.version 列）。"""
+    """对已有数据库做幂等升级。
+
+    * 旧库 ``containers`` 表没有 ``version`` 列：补齐，已有容器版本统一视为 0；
+    * 旧库没有 ``idempotent_requests`` 表：由建表脚本中的
+      ``CREATE TABLE IF NOT EXISTS`` 自动补建（容器启动时执行，无需手工迁移）。
+    """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(containers)")}
     if columns and "version" not in columns:
         # 旧库中的容器版本统一视为 0（DEFAULT 0 会回填到每一行）

@@ -14,6 +14,10 @@
 - 可选的**乐观并发保护**：每个容器持久化一个整数 `version`（创建时为 0），
   `GET /containers/{id}` 返回当前版本；批量提交/预演可携带 `expected_versions`
   做版本校验，成功提交后每个被触碰容器的版本恰好加 1（同批多次出现也只加 1）。
+- 可选的**幂等键** `idempotency_key`：`POST /transfers/batch` 可携带幂等键，
+  成功请求的请求指纹与完整响应与转移**写入同一 SQLite 事务**；网络重试时同键同
+  请求体直接**重放首次结果**（不再次扣减体积、不递增 `version`），同键不同请求体
+  返回 `409 idempotency_conflict`。预演接口不写幂等记录；不带幂等键时行为完全不变。
 - 可查询任一容器的**当前体积**以及各祖先初始样品的**来源占比**。
 
 ---
@@ -37,6 +41,15 @@ docker compose up --build
 1. 安装 Python 依赖（`requirements.txt`）；
 2. 在 `DATABASE_PATH` 处创建 SQLite 数据库与表（已存在则保持不变，幂等）；
 3. 启动 uvicorn。
+
+启动时的建库/迁移同样是**幂等**的，老版本镜像可以直接用新镜像替换重启：
+
+- 旧库缺少 `containers.version` 列时自动 `ALTER TABLE` 补齐，已有容器版本视为 `0`；
+- 旧库缺少 `idempotent_requests`（幂等记录）表时自动 `CREATE TABLE IF NOT EXISTS` 补建，
+  旧数据原样保留，升级后即可使用幂等键功能。
+
+也就是说**无需手工迁移**：使用命名卷升级时 `docker compose up --build` 会在启动阶段
+自动完成；幂等表为空，历史请求不受影响（不带幂等键的调用行为完全不变）。
 
 SQLite 数据保存在 Docker 命名卷 `lineage-data`（容器内 `/data`）中，重启不丢失。
 
@@ -72,6 +85,12 @@ docker compose down -v       # 同时删除数据卷
 - 每个容器额外持久化一个整数 **`version`**：创建（样品/空容器）时为 `0`，每次成功的
   批量转移后被触碰的容器加 1（同批多次触碰只加 1），用于 `expected_versions` 乐观并发控制。
   服务启动时会自动为旧版本数据库补齐该列，已有容器的版本视为 `0`，无需手工迁移。
+- 幂等记录表 **`idempotent_requests`**：仅在批量提交携带 `idempotency_key` **且成功**时
+  写入一行，与当批转移在**同一个 SQLite 事务**内提交。每行保存幂等键（主键）、请求指纹
+  （剔除 `idempotency_key` 后的请求体规范化 JSON 的 SHA-256）、首次成功响应的**完整 JSON**
+  与 HTTP 状态码。同键重放时直接取该行返回，不触碰 `containers` / `components`；
+  同键指纹不同则报 `409 idempotency_conflict`。失败（4xx/5xx）的请求不写该表。
+  服务启动时会自动为旧版本数据库补建该表。
 
 ---
 
@@ -143,6 +162,53 @@ curl -X POST http://localhost:8000/transfers/batch \
 # 200 -> {"applied":1,"message":"已依次提交 1 条转移","versions":{"S1":1,"V1":1}}
 ```
 
+#### 可选：幂等键（idempotency_key）
+
+批量提交可携带幂等键——放在请求体的 `idempotency_key` 字段，或放在
+`Idempotency-Key` 请求头（二者等价；同时给出且取值不一致时返回
+`422 invalid_idempotency_key`）。键为去首尾空白后的非空字符串，最长 255。
+
+携带幂等键时的行为：
+
+- **首次请求（键不存在）**：正常执行整批转移，并且在**同一个 SQLite 事务**内写入
+  一条幂等记录：请求指纹（请求体剔除 `idempotency_key` 后的规范化 JSON 的 SHA-256）
+  + **完整响应 JSON**。转移失败（任何 4xx）则整批回滚，**不会**留下幂等记录，
+  客户端可用同一键修正请求体重试。
+- **同键同请求体重试（指纹一致）**：不执行任何转移，直接**重放**首次的完整响应
+  （`applied`、`message`、`versions` 与首次完全一致）；因此**不会再次扣减体积、
+  不会递增 version**。典型场景：请求超时 / 连接中断后客户端安全重试。
+- **同键不同请求体（指纹不一致）**：返回 `409 idempotency_conflict`，不执行任何写入；
+  请更换幂等键后重试。
+- 指纹按 Pydantic 校验规范化后的请求体计算：JSON 键顺序、空白不影响指纹；
+  `volume` 的数字 `3` 与字符串 `"3"` 视为同一请求；`expected_versions` 参与指纹。
+- **不携带**幂等键时行为与旧版本完全一致（可重复提交、各自扣减）。
+- `POST /transfers/preview` 即使请求体里带了 `idempotency_key` 也会忽略，**绝不写
+  幂等记录**（预演本就不落库）。
+
+```bash
+# 首次提交（幂等键也可改用 -H 'Idempotency-Key: order-7788'）
+curl -X POST http://localhost:8000/transfers/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"idempotency_key":"order-7788",
+       "transfers":[{"source":"S1","destination":"V1","volume":"40"}]}'
+# 200 -> {"applied":1,"message":"已依次提交 1 条转移","versions":{"S1":1,"V1":1}}
+
+# 网络超时后用完全相同的请求体重试：重放首次结果，不二次扣减、版本不再增加
+curl -X POST http://localhost:8000/transfers/batch \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-7788' \
+  -d '{"transfers":[{"source":"S1","destination":"V1","volume":"40"}]}'
+# 200 -> {"applied":1,"message":"已依次提交 1 条转移","versions":{"S1":1,"V1":1}}  （重放）
+
+# 同键但请求体不同（体积改成 50）：
+curl -X POST http://localhost:8000/transfers/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"idempotency_key":"order-7788",
+       "transfers":[{"source":"S1","destination":"V1","volume":"50"}]}'
+# 409 -> {"error":{"code":"idempotency_conflict",
+#          "message":"幂等键 'order-7788' 已用于另一个不同的请求体（请求指纹不一致）：请更换 idempotency_key 后重试"}}
+```
+
 **整批拒绝**的情形（HTTP 状态码与错误码）：
 
 | 情形 | 状态码 | `error.code` |
@@ -153,6 +219,8 @@ curl -X POST http://localhost:8000/transfers/batch \
 | 体积为 0、为负、非有限数，或小数位超过 `DECIMAL_SCALE` | 422 | `invalid_volume` |
 | `expected_versions` 未恰好覆盖本批全部源/目标（含空对象） | 422 | `invalid_expected_versions` |
 | `expected_versions` 中某容器版本与当前版本不符 | 409 | `stale_container` |
+| 幂等键为空白字符串，或 body 与请求头中的键不一致 | 422 | `invalid_idempotency_key` |
+| 同一幂等键对应了不同的请求体（指纹不一致） | 409 | `idempotency_conflict` |
 
 错误响应形如：
 
@@ -177,6 +245,10 @@ curl -X POST http://localhost:8000/transfers/batch \
 `409 stale_container`，HTTP 状态码、`error.code` 以及消息中的条目序号（“第 N 条转移”）
 均与 `/transfers/batch` 完全一致。预演**只读不写、不递增版本**，成功或失败都不会改变
 数据库，可以安全地重复调用；因此可用于“先核对预期版本、确认提交后版本，再正式提交”。
+
+> 预演接口**不写幂等记录**：即使请求体携带 `idempotency_key`（或
+> `Idempotency-Key` 头）也会被忽略，预演不会“占用”该键；预演之后再用同键正式
+> 提交仍属首次执行，之后同键重放才命中。
 
 ```bash
 curl -X POST http://localhost:8000/transfers/preview \
@@ -292,11 +364,11 @@ pytest -q
 ```
 app/
   config.py     # 环境变量配置
-  db.py         # SQLite 连接、建库（启动时执行）
-  schemas.py    # Pydantic 请求/响应模型（Decimal <-> 字符串）
-  service.py    # 核心逻辑：登记、批量转移事务、比例分摊、查询
+  db.py         # SQLite 连接、建库与旧库迁移（启动时执行；含幂等记录表）
+  schemas.py    # Pydantic 请求/响应模型（Decimal <-> 字符串、idempotency_key）
+  service.py    # 核心逻辑：登记、批量转移事务、幂等重放、比例分摊、查询
   main.py       # FastAPI 路由与错误处理
-tests/          # pytest 端到端与分摊算法测试
+tests/          # pytest 端到端与分摊算法测试（含 test_idempotency.py）
 Dockerfile
 docker-compose.yml
 docker-entrypoint.sh

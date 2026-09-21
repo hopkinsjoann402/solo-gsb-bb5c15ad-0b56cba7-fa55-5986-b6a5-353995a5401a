@@ -16,12 +16,19 @@
   :func:`_simulate_transfers`），错误码与条目序号完全一致；
   预演只读不写（不递增 version），无论成功失败都不改变数据库，但返回中给出
   若真实提交后各容器将变成的 version（当前 version + 1）。
+* ``/transfers/batch`` 可选携带 ``idempotency_key``（见
+  :func:`apply_transfers_idempotent`）：成功时请求指纹与完整响应和转移**同一
+  事务**持久化；同键同请求体重放首次结果（不再扣减、不递增 version），同键
+  不同请求体返回 409 idempotency_conflict；失败不写幂等记录。预演不写幂等记录。
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from collections.abc import Iterable, Mapping
 from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal, localcontext
+from typing import Any
 
 from .config import VOLUME_QUANTUM, settings
 
@@ -316,6 +323,24 @@ def _simulate_transfers(
     return touched, versions, taken_steps
 
 
+def _commit_transfers(
+    conn: sqlite3.Connection,
+    prepared: list[tuple[str, str, Decimal]],
+    expected_versions: Mapping[str, int] | None,
+) -> tuple[int, Versions]:
+    """在已开启的写事务内完成“模拟 -> 落库”，不含事务边界。
+
+    成功时各被触碰容器 version 恰好加 1；任一校验失败抛 :class:`LineageError`
+    （不触碰事务状态，调用方负责回滚）。返回 ``(转移条数, 提交后各容器 version)``。
+    """
+    touched, current_versions, _taken = _simulate_transfers(
+        conn, prepared, expected_versions
+    )
+    next_versions = {cid: ver + 1 for cid, ver in current_versions.items()}
+    _persist_states(conn, touched, next_versions)
+    return len(prepared), next_versions
+
+
 def apply_transfers(
     conn: sqlite3.Connection,
     transfers: Iterable[tuple[str, str, Decimal]],
@@ -335,17 +360,110 @@ def apply_transfers(
     # IMMEDIATE：拿到写锁后再读版本与状态，保证“校验+写入”在同一写事务内原子
     conn.execute("BEGIN IMMEDIATE")
     try:
-        touched, current_versions, _taken = _simulate_transfers(
-            conn, prepared, expected_versions
-        )
-        next_versions = {cid: ver + 1 for cid, ver in current_versions.items()}
-        _persist_states(conn, touched, next_versions)
+        applied, next_versions = _commit_transfers(conn, prepared, expected_versions)
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
 
-    return len(prepared), next_versions
+    return applied, next_versions
+
+
+def fingerprint_request(payload: Mapping[str, Any]) -> str:
+    """计算请求体指纹：规范化 JSON（sort_keys、不跳过非 ASCII、键序稳定）的 SHA-256。
+
+    入参应为校验后的请求体字典（已剔除 ``idempotency_key``，键集合为
+    transfers / expected_versions）。数字、Decimal 与字符串按 Pydantic 校验后的
+    Python 值序列化，因此 40 与 "40" 视为同一请求；JSON 键顺序、空白差异不影响
+    指纹。同键指纹不同即视为不同请求。
+    """
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,  # Decimal 等非原生类型回退为 str（实际响应路径不会走到）
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def apply_transfers_idempotent(
+    conn: sqlite3.Connection,
+    transfers: Iterable[tuple[str, str, Decimal]],
+    expected_versions: Mapping[str, int] | None,
+    idempotency_key: str,
+    request_fingerprint: str,
+) -> tuple[dict, bool]:
+    """带幂等键的批量转移，返回 ``(响应体, 是否为重放)``。
+
+    语义：
+
+    * 键不存在：在 **同一个 SQLite 写事务** 内完成转移扣减、version 递增与
+      幂等记录（请求指纹 + 完整响应 JSON）写入；转移任一校验失败则整批回滚，
+      **不留下** 幂等记录（允许客户端用同键修正后重试）。
+    * 键已存在且指纹一致：直接重放首次响应，**不再扣减体积、不递增 version**。
+    * 键已存在但指纹不同：抛 409 idempotency_conflict（不写任何内容）。
+
+    参数校验（体积/容器/expected_versions 覆盖）在查键与开启事务前完成，
+    与非幂等路径保持相同的 422 行为且必然不触碰数据库。
+    """
+    prepared = _prepare_transfers(transfers)
+    _validate_expected_coverage(prepared, expected_versions)
+
+    # IMMEDIATE 先拿写锁再查键：并发同键请求在此串行化，杜绝双重扣减
+    conn.execute("BEGIN IMMEDIATE")
+    replay: dict | None = None
+    conflict = False
+    try:
+        existing = conn.execute(
+            "SELECT request_fingerprint, response_json, status_code "
+            "FROM idempotent_requests WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+
+        if existing is not None:
+            if existing["request_fingerprint"] != request_fingerprint:
+                # 同键不同请求体：事务内未做任何修改，先结束事务再在块外抛 409
+                conflict = True
+            else:
+                # 命中：原样重放首次成功结果，绝不再次执行转移
+                replay = json.loads(existing["response_json"])
+            conn.execute("COMMIT")
+        else:
+            # 未命中：转移与幂等记录同一事务提交；失败统一在 except 回滚
+            applied, next_versions = _commit_transfers(conn, prepared, expected_versions)
+            response: dict = {
+                "applied": applied,
+                "message": f"已依次提交 {applied} 条转移",
+                "versions": next_versions,
+            }
+            conn.execute(
+                "INSERT INTO idempotent_requests "
+                "(idempotency_key, request_fingerprint, response_json, status_code) "
+                "VALUES (?, ?, ?, 200)",
+                (
+                    idempotency_key,
+                    request_fingerprint,
+                    json.dumps(response, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
+            conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    if conflict:
+        raise LineageError(
+            409,
+            "idempotency_conflict",
+            (
+                f"幂等键 '{idempotency_key}' 已用于另一个不同的请求体"
+                "（请求指纹不一致）：请更换 idempotency_key 后重试"
+            ),
+        )
+    if replay is not None:
+        return replay, True
+    return response, False
 
 
 def preview_transfers(

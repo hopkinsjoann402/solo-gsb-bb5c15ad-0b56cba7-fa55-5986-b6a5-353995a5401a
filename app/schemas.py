@@ -68,6 +68,28 @@ class BatchTransferIn(BaseModel):
             "不提供时保持无版本校验的兼容行为。"
         ),
     )
+    idempotency_key: str | None = Field(
+        default=None,
+        max_length=255,
+        description=(
+            "可选幂等键（也可通过 Idempotency-Key 请求头提供，二者同时给出且"
+            "不一致时返回 422 invalid_idempotency_key）。携带时：成功请求与转移"
+            "写入同一 SQLite 事务，持久化请求指纹与完整响应；同键且请求体（除"
+            " idempotency_key 外）完全一致时直接重放首次结果，不再扣减体积、"
+            "不递增 version；同键但请求体不同返回 409 idempotency_conflict。"
+            "失败请求不写入幂等记录。不携带时保持原有兼容行为。/transfers/preview"
+            " 接受该字段但绝不写入幂等记录。"
+        ),
+    )
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _normalize_idempotency_key(cls, v: str | None) -> str | None:
+        # 仅做去空白规范化；空白字符串（归一化为 ""）由路由层统一按
+        # 422 invalid_idempotency_key 错误信封拒绝
+        if v is None:
+            return None
+        return v.strip()
 
     @field_validator("expected_versions", mode="before")
     @classmethod
